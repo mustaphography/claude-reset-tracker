@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="Claude Reset Tracker"
 EXE_NAME="ClaudeResetTracker"
 BUNDLE_ID="com.mustaphography.ClaudeResetTracker"
-VERSION="1.0.0"
+VERSION="1.1.0"
 BUILD_DIR="$ROOT/build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 

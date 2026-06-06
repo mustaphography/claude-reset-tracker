@@ -17,7 +17,8 @@ struct MenuBarView: View {
             footer
         }
         .padding(16)
-        .frame(width: 260)
+        .frame(width: 268)
+        .onAppear { tracker.refresh() }
     }
 
     @ViewBuilder private var header: some View {
@@ -29,22 +30,52 @@ struct MenuBarView: View {
                 Text(Self.timeFormatter.string(from: reset))
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
                     .monospacedDigit()
-                if let start = tracker.sessionStart {
-                    Text("Window started \(Self.timeFormatter.string(from: start))")
+                    .foregroundStyle(headerColor)
+                    .shadow(color: .primary.opacity(0.25), radius: 0.5)
+                Text(subtitle(reset: reset))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let weekly = tracker.weeklyUtilization {
+                    Text("Weekly limit: \(Int(weekly.rounded()))% used")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+            }
+        } else if tracker.authExpired {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Usage unavailable")
+                    .font(.system(size: 18, weight: .semibold, design: .rounded))
+                Text("Claude Code login expired. Run `claude` and sign in, then click Refresh.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         } else {
             VStack(alignment: .leading, spacing: 6) {
                 Text("No active window")
                     .font(.system(size: 18, weight: .semibold, design: .rounded))
-                Text("Send a message in Claude Code to start the 5-hour timer.")
+                Text("Send a message in Claude Code to start the 5-hour window.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private var headerColor: Color {
+        if let u = tracker.utilization {
+            return Color(nsColor: MenuBarIcon.color(utilization: u))
+        }
+        return .primary
+    }
+
+    private func subtitle(reset: Date) -> String {
+        let mins = max(0, Int(reset.timeIntervalSince(Date()) / 60))
+        let remaining = mins >= 60 ? "resets in \(mins / 60)h \(mins % 60)m" : "resets in \(mins)m"
+        if let u = tracker.utilization {
+            return "\(Int(u.rounded()))% of 5-hour limit · \(remaining)"
+        }
+        return remaining  // usage unknown (offline) — still show the countdown
     }
 
     private var footer: some View {

@@ -9,7 +9,7 @@ struct ClaudeResetTrackerApp: App {
         MenuBarExtra {
             MenuBarView(tracker: tracker)
         } label: {
-            Text(tracker.menuBarLabel)
+            Image(nsImage: tracker.menuBarImage)
         }
         .menuBarExtraStyle(.window)
     }

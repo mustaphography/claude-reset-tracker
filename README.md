@@ -1,16 +1,16 @@
 # Claude Reset Tracker
 
-A tiny macOS menu bar app that tells you the **exact clock time** of your next Claude 5‑hour usage reset. Click the icon, see "Next reset: 8:15 PM". That's it.
+A tiny macOS menu bar app that shows the **exact clock time** of your next Claude 5‑hour usage reset — and tints it by your **real usage**. Glance up, see `5:00 AM` in green/yellow/red. That's it.
 
-No countdown, no notifications, no telemetry, no login — it reads your local Claude Code session files to figure out when your current 5‑hour window started.
+No countdown to do math on, no notifications, no telemetry. It reads your real usage straight from Anthropic's own usage endpoint (the same way the [Nimbalyst](https://github.com/Nimbalyst/nimbalyst) editor does).
 
 ## Why it exists
 
-Claude's 5‑hour rate window opens the moment you send your first message and ends exactly 5 hours later. Knowing the **clock time** of the reset is more useful than "you have 1h 47m left" — you can plan around 8:15 PM, you can't plan around a moving countdown.
+Claude's 5‑hour rate window opens with your first message and resets 5 hours later. Knowing the **clock time** of the reset ("11:00 PM") is more useful than a moving "1h 47m left," and a quick color tells you how much of your limit you've burned without opening anything.
 
 ## Install
 
-Requires macOS 13 (Ventura) or newer and the Swift toolchain (ships with Xcode or Command Line Tools).
+Requires macOS 13 (Ventura) or newer, the Swift toolchain (ships with Xcode or Command Line Tools), and a logged‑in Claude Code (`claude`).
 
 ```bash
 git clone https://github.com/mustaphography/claude-reset-tracker.git
@@ -18,54 +18,59 @@ cd claude-reset-tracker
 ./build.sh --install
 ```
 
-That compiles the app, packages it as `Claude Reset Tracker.app`, copies it to `/Applications`, and launches it. Look for the clock icon in your menu bar.
+That compiles the app, packages it as `Claude Reset Tracker.app`, copies it to `/Applications`, and launches it. Look for the colored time in your menu bar.
 
-To build without installing:
-
-```bash
-./build.sh
-open "build/Claude Reset Tracker.app"
-```
+**On first launch macOS shows a Keychain prompt** — *"…wants to use the confidential information stored in 'Claude Code‑credentials'."* Click **Always Allow**. That's the app reading your Claude Code login token to ask Anthropic for your usage (see [Privacy](#privacy--security)). One‑time click.
 
 To launch on login: System Settings → General → Login Items → add `Claude Reset Tracker`.
 
 ## How it works
 
-When you send a message in Claude Code, it appends to a JSONL transcript at `~/.claude/projects/<encoded-path>/<session-id>.jsonl`. Each line is one event with an ISO‑8601 `timestamp`. Claude Code knows your exact reset time (it shows "Resets in 2h 23m") but **does not persist it** — it only lives in the API rate‑limit headers in memory. So a standalone app has to reconstruct it from the transcript timestamps.
+The menu bar shows your next reset time, colored by how much of the 5‑hour limit you've used:
 
-The app:
+| Usage | Color |
+| --- | --- |
+| 0–49% | 🟢 green |
+| 50–79% | 🟡 yellow |
+| 80–100% | 🔴 red |
+| unknown (offline / logged out) | gray |
 
-1. Walks `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR/projects`) for `.jsonl` files modified in the last 12 hours.
-2. Collects the timestamp of every **real user prompt** — `type: "user"` messages whose content is a typed prompt, excluding tool results and subagent (sidechain) messages.
-3. Reconstructs sessions: walking prompts oldest→newest, a new 5‑hour window opens whenever a prompt arrives **5h or more** after the current window started. The most recent window is the active one.
-4. Computes the reset as **first‑message‑time + 5h, rounded *up* to the top of the hour**.
-5. Re‑checks every 60 seconds, and again every time you click the icon.
+Both the time and the percentage are **real, authoritative values** from Anthropic — not guesses. The app:
 
-### Why round up to the hour?
+1. Reads your Claude Code OAuth token from the macOS Keychain (item `Claude Code-credentials`).
+2. Calls `GET https://api.anthropic.com/api/oauth/usage` with that token (headers: `Authorization: Bearer …`, `anthropic-beta: oauth-2025-04-20`).
+3. Reads `five_hour.utilization` (your usage %) and `five_hour.resets_at` (the exact reset instant), plus `seven_day` for the weekly figure.
+4. Re‑checks every 5 minutes, and every time you open the popover.
 
-Claude's 5‑hour windows reset on a clock‑hour boundary. The reset can only be rounded **up**, never down — rounding down would let a new window open before 5 hours elapsed and hand out free quota, which Anthropic doesn't do. So:
+This is the same approach the open‑source Nimbalyst editor uses, including the 50% / 80% color thresholds.
 
-```
-first message 5:39 PM  →  + 5h = 10:39 PM  →  reset rounds up to 11:00 PM
-```
+### Offline fallback
 
-Hour boundaries are anchored to **UTC** (server‑side), and the app rounds in UTC before formatting in your local time. For whole‑hour timezones (most of the world) this is identical to local rounding; for half‑hour offsets like UTC+5:30 (India) or UTC+3:30 (Iran) the UTC anchor is the correct one.
+If you're offline or your login has expired, the app falls back to **reconstructing** the reset from your local transcripts in `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR/projects`): it finds your first prompt of the current window and computes first‑message + 5h, **rounded up to the top of the UTC hour** (the reset can only round up — rounding down would hand out free quota). In this mode the time still shows, in gray, but the usage color is unavailable.
+
+## Privacy & security
+
+This app handles your Claude credentials, so here's exactly what it does — all of it is in [`UsageService.swift`](Sources/ClaudeResetTracker/UsageService.swift), ~100 lines you can read:
+
+- It reads the OAuth token from the Keychain item **Claude Code created** (`Claude Code-credentials`), via `/usr/bin/security`.
+- It sends that token to **one place only: `https://api.anthropic.com/api/oauth/usage`** — Anthropic's official usage endpoint.
+- It **never writes the token to disk, never logs it, and never sends it anywhere else.** No analytics, no third‑party servers, no network calls besides that one Anthropic endpoint.
+- The macOS Keychain prompt on first launch is macOS asking *you* to authorize this access. You can revoke it any time in **Keychain Access**.
 
 ## States
 
 | What you see | What it means |
 | --- | --- |
-| **Next reset: HH:MM** | Active window. You sent your first message at "Window started …" and reset is 5h after that. |
-| **No active window** | Nothing in `~/.claude/projects/` within the last 5h. Send a message in Claude Code to start the timer. |
-| Reset time has passed | Auto-refresh hasn't run yet. Click **Refresh** — the next message you send opens a fresh window. |
+| **Colored time (e.g. `5:00 AM`)** | Active window. Color = real 5‑hour usage. Click for the exact % and weekly usage. |
+| **Gray time** | Usage couldn't be fetched (offline / transient) — the time is from the transcript fallback. |
+| **Usage unavailable** | Claude Code login expired. Run `claude`, sign in, then click Refresh. |
+| **—** | No active window and nothing to reconstruct. Send a message in Claude Code. |
 
 ## Limitations
 
-- **Claude Code only.** It reads local transcripts, so it can't see Claude.ai web/mobile/desktop usage. If your account's window was actually opened by a web session, the reconstructed time can be off. (Most Claude Code users start their window in the terminal, so in practice it's accurate.)
-- **One machine's view.** The 5‑hour limit is account‑wide, but the app only sees the transcripts on *this* Mac. If you also use Claude Code on another machine, the earliest first‑message there isn't visible here.
-- **Reconstructed, not reported.** Because Claude Code doesn't persist the reset time, this is an inference. It matches Claude's own "Resets in …" in every case tested, but it's derived from timestamps + the rounding rule above, not read from an official field.
-- If you wipe `~/.claude/projects/`, the app will correctly show "No active window" until your next message.
-- Ad‑hoc signed — on first launch macOS may say "from an unidentified developer". Right‑click the app → Open → Open. After that it launches normally.
+- **Account‑wide and accurate.** Because the numbers come from Anthropic's account‑level endpoint, they reflect your real usage across machines and clients — not just this Mac. (The old transcript‑only approach couldn't do this; the API can.)
+- **Needs a logged‑in Claude Code.** The token comes from Claude Code's Keychain item. No Claude Code login → no usage (offline fallback shows the reconstructed time in gray).
+- **Ad‑hoc signed.** On first launch macOS may say "from an unidentified developer." Right‑click the app → Open → Open. After that it launches normally. (Because it's ad‑hoc signed, the Keychain "Always Allow" is tied to `/usr/bin/security`, so it persists across rebuilds.)
 
 ## Project layout
 
@@ -74,7 +79,9 @@ claude-reset-tracker/
 ├── Package.swift
 ├── Sources/ClaudeResetTracker/
 │   ├── ClaudeResetTrackerApp.swift   # @main, MenuBarExtra wiring
-│   ├── SessionTracker.swift          # window detection + refresh
+│   ├── SessionTracker.swift          # state, API + transcript fallback, refresh loop
+│   ├── UsageService.swift            # Keychain read + Anthropic usage API
+│   ├── MenuBarIcon.swift             # colored-time rendering + thresholds
 │   └── MenuBarView.swift             # the small popover UI
 ├── build.sh                          # SPM build + .app bundle wrapper
 ├── LICENSE

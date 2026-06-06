@@ -1,10 +1,14 @@
 import Foundation
 import Combine
+import AppKit
 
 @MainActor
 final class SessionTracker: ObservableObject {
-    @Published private(set) var sessionStart: Date?
     @Published private(set) var nextReset: Date?
+    @Published private(set) var sessionStart: Date?        // from transcripts, for display/fallback
+    @Published private(set) var utilization: Double?       // real 5-hour usage %, nil if unknown
+    @Published private(set) var weeklyUtilization: Double? // real 7-day usage %
+    @Published private(set) var authExpired: Bool = false  // Claude Code login expired
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var lastChecked: Date = Date()
 
@@ -13,25 +17,34 @@ final class SessionTracker: ObservableObject {
     private let claudeProjectsPath: String
     private var refreshTimer: Timer?
 
-    var hasActiveSession: Bool {
-        guard let nextReset = nextReset else { return false }
-        return nextReset > Date()
-    }
-
-    var menuBarLabel: String {
-        guard hasActiveSession, let reset = nextReset else {
-            return "Claude –:––"
-        }
+    private static let menuTimeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "h:mm a"
         f.amSymbol = "AM"
         f.pmSymbol = "PM"
-        return "↻ " + f.string(from: reset)
+        return f
+    }()
+
+    var hasActiveSession: Bool {
+        guard let reset = nextReset, reset > Date() else { return false }
+        if let u = utilization { return u > 0 }   // API is authoritative
+        return sessionStart != nil                 // fallback: transcripts say we have a window
+    }
+
+    /// The menu bar label: the reset time, tinted by real usage (gray if usage
+    /// is unknown). Re-read on each refresh tick so it keeps pace.
+    var menuBarImage: NSImage {
+        guard hasActiveSession, let reset = nextReset else {
+            return MenuBarIcon.render(text: "—", color: MenuBarIcon.neutral)
+        }
+        let text = Self.menuTimeFormatter.string(from: reset)
+        if let u = utilization {
+            return MenuBarIcon.render(text: text, color: MenuBarIcon.color(utilization: u))
+        }
+        return MenuBarIcon.render(text: text, color: MenuBarIcon.neutral)
     }
 
     init() {
-        // Honor a custom config location if the user set one; otherwise ~/.claude.
-        // (GUI launches don't inherit shell env, so this mainly helps terminal launches.)
         let env = ProcessInfo.processInfo.environment
         let baseDir: String
         if let custom = env["CLAUDE_CONFIG_DIR"], !custom.isEmpty {
@@ -41,20 +54,13 @@ final class SessionTracker: ObservableObject {
         }
         self.claudeProjectsPath = baseDir + "/projects"
         refresh()
-        scheduleAutoRefresh()
-    }
-
-    deinit {
-        refreshTimer?.invalidate()
-    }
-
-    private func scheduleAutoRefresh() {
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refresh()
-            }
+        // Usage changes as you work; poll every 5 min (plus on demand / on open).
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
         }
     }
+
+    deinit { refreshTimer?.invalidate() }
 
     func refresh() {
         guard !isLoading else { return }
@@ -63,24 +69,33 @@ final class SessionTracker: ObservableObject {
         let window = windowDuration
         let lookback = lookbackDuration
 
-        Task.detached(priority: .userInitiated) {
-            let start = Self.detectActiveSessionStart(
-                at: path,
-                windowDuration: window,
-                lookbackDuration: lookback
-            )
-            await MainActor.run {
-                self.sessionStart = start
-                if let start = start {
-                    self.nextReset = Self.resetTime(forStart: start, window: window)
-                } else {
-                    self.nextReset = nil
-                }
-                self.lastChecked = Date()
-                self.isLoading = false
+        Task {
+            // Primary source: Anthropic's usage endpoint (real % + real reset).
+            let usage = await UsageService.fetch()
+            // Fallback / context: reconstruct the window from local transcripts.
+            let start = await Task.detached(priority: .userInitiated) {
+                Self.detectActiveSessionStart(at: path, windowDuration: window, lookbackDuration: lookback)
+            }.value
+
+            self.utilization = usage.fiveHourUtilization
+            self.weeklyUtilization = usage.sevenDayUtilization
+            self.authExpired = usage.authExpired
+            self.sessionStart = start
+
+            if let apiReset = usage.fiveHourResetsAt {
+                self.nextReset = apiReset                                  // authoritative
+            } else if let start = start {
+                self.nextReset = Self.resetTime(forStart: start, window: window)  // reconstructed
+            } else {
+                self.nextReset = nil
             }
+
+            self.lastChecked = Date()
+            self.isLoading = false
         }
     }
+
+    // MARK: - Transcript fallback (used only when the API is unavailable)
 
     nonisolated private static func detectActiveSessionStart(
         at path: String,
@@ -108,7 +123,6 @@ final class SessionTracker: ObservableObject {
 
         for case let url as URL in enumerator {
             guard url.pathExtension == "jsonl" else { continue }
-
             let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
             guard values?.isRegularFile == true else { continue }
             if let mtime = values?.contentModificationDate, mtime < lookbackStart { continue }
@@ -120,18 +134,11 @@ final class SessionTracker: ObservableObject {
                 guard let lineData = line.data(using: .utf8),
                       let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                       (obj["type"] as? String) == "user" else { continue }
-
-                // Subagent (sidechain) prompts are spawned by a main-thread
-                // prompt that already counts; skip them so a background agent
-                // can't be mistaken for the window's opening message.
                 if (obj["isSidechain"] as? Bool) == true { continue }
-
                 guard Self.isRealUserPrompt(obj) else { continue }
-
                 guard let tsString = obj["timestamp"] as? String else { continue }
                 let parsed = iso.date(from: tsString) ?? isoNoFrac.date(from: tsString)
                 guard let ts = parsed, ts >= lookbackStart, ts <= now else { continue }
-
                 prompts.append(ts)
             }
         }
@@ -139,31 +146,20 @@ final class SessionTracker: ObservableObject {
         guard !prompts.isEmpty else { return nil }
         prompts.sort()
 
-        // Walk forward; a prompt at or after sessionStart + 5h opens a new session.
+        // A new window opens only when a prompt lands at/after the current
+        // window's ACTUAL reset (start + 5h rounded up to the hour) — not the
+        // raw +5h, or a prompt in the rounded tail (e.g. 10:43 when reset is
+        // 11:00) would be mistaken for a fresh window.
         var sessionStart = prompts[0]
-        for ts in prompts.dropFirst() {
-            if ts >= sessionStart.addingTimeInterval(windowDuration) {
-                sessionStart = ts
-            }
+        for ts in prompts.dropFirst() where ts >= resetTime(forStart: sessionStart, window: windowDuration) {
+            sessionStart = ts
         }
-
-        // If the latest session has already expired, report no active session.
-        if now >= sessionStart.addingTimeInterval(windowDuration) {
-            return nil
-        }
+        if now >= resetTime(forStart: sessionStart, window: windowDuration) { return nil }
         return sessionStart
     }
 
-    /// Claude's usage window resets at the top of the hour: the reset is the
-    /// first message time + 5h, rounded UP to the next whole hour.
-    /// e.g. first message 5:39 PM → exact 10:39 PM → reset 11:00 PM.
-    ///
-    /// Anthropic never rounds the reset *down* (that would grant free quota by
-    /// opening a new window early), so the only valid hour-aligned rounding is
-    /// up. Hour boundaries are anchored to UTC server-side, so we ceil in UTC
-    /// and let the view format the resulting instant in the user's local time.
-    /// This matters only for sub-hour timezone offsets (e.g. UTC+5:30); for
-    /// whole-hour zones UTC and local rounding are identical.
+    /// Reconstructed reset: first message + 5h, rounded UP to the top of the
+    /// UTC hour. Only used when the live API value isn't available.
     nonisolated private static func resetTime(forStart start: Date, window: TimeInterval) -> Date {
         let exact = start.addingTimeInterval(window)
         var cal = Calendar(identifier: .gregorian)
@@ -179,9 +175,7 @@ final class SessionTracker: ObservableObject {
         let content = message["content"]
         if content is String { return true }
         if let arr = content as? [[String: Any]] {
-            if let first = arr.first, (first["type"] as? String) == "tool_result" {
-                return false
-            }
+            if let first = arr.first, (first["type"] as? String) == "tool_result" { return false }
             return true
         }
         return false
