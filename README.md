@@ -13,7 +13,7 @@ Claude's 5‑hour rate window opens the moment you send your first message and e
 Requires macOS 13 (Ventura) or newer and the Swift toolchain (ships with Xcode or Command Line Tools).
 
 ```bash
-git clone https://github.com/<you>/claude-reset-tracker.git
+git clone https://github.com/mustaphography/claude-reset-tracker.git
 cd claude-reset-tracker
 ./build.sh --install
 ```
